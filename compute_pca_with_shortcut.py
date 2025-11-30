@@ -289,6 +289,27 @@ def compute_layer_pca_rotations_with_shortcut(
             layer.to('cpu')
             cleanup_memory()
 
+        # ===== 旋转 lm_head (Language Model Head) =====
+        print("\n" + "="*50)
+        print("Rotating lm_head (final projection to vocabulary)...")
+        print("="*50)
+        print(f"Using Q_out from last layer (layer {num_layers-1})")
+
+        # Q_prev 现在是最后一层的 Q_out
+        lm_head = model.lm_head
+        print(f"Original lm_head weight shape: {lm_head.weight.shape}")
+
+        # 旋转 lm_head: W_new = W @ Q
+        dtype = lm_head.weight.data.dtype
+        W_ = lm_head.weight.data.to(device=device, dtype=torch.float64)
+        Q_device = Q_prev.to(device=device, dtype=torch.float64)
+
+        lm_head.weight.data = torch.matmul(W_, Q_device).to(device="cpu", dtype=dtype)
+        print(f"Rotated lm_head weight shape: {lm_head.weight.shape}")
+        print("✓ lm_head rotation complete")
+
+        cleanup_memory()
+
         # 替换为 CompressedLlamaDecoderLayer
         print("\n" + "="*50)
         print("Replacing layers with CompressedLlamaDecoderLayer...")
