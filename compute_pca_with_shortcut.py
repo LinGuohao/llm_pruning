@@ -476,7 +476,7 @@ if __name__ == "__main__":
     )
 
     # 保存结果
-    save_results(results, shortcut_Qs, "pca_with_shortcut_lm_head")
+    #save_results(results, shortcut_Qs, "pca_with_shortcut_lm_head")
 
     # 保存旋转后的模型（包含 shortcut Q）
     # 模仿 SliceGPT 的保存方式：只保存 state_dict
