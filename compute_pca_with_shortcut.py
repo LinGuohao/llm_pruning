@@ -407,7 +407,7 @@ if __name__ == "__main__":
 
     # 保存旋转后的模型（包含 shortcut Q）
     # 模仿 SliceGPT 的保存方式：只保存 state_dict
-    save_path = "rotated_llama_model_with_shortcut"
+    save_path = "rotated_llama_model_with_shortcut_lm_head"
     print(f"\nSaving rotated model with shortcut Q to {save_path}...")
     print("Using SliceGPT-style saving method (state_dict only)...")
 
