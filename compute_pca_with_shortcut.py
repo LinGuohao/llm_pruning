@@ -24,6 +24,36 @@ from compute_pca_rotation import (
 )
 
 
+def fuse_ln_linear(layernorm, linear_layers):
+    """
+    将 RMSNorm 的权重融合到后续的 Linear 层中
+    参考 SliceGPT 的 fuse_ln_linear 实现
+
+    专门针对 Llama 模型（使用 RMSNorm，无 bias）
+
+    原理：
+    原始: y = Linear(RMSNorm(x))
+          = W @ (x * rms_weight)
+
+    融合后: y = (W * rms_weight) @ x
+
+    其中 rms_weight 是 RMSNorm 的缩放系数（逐元素）
+
+    Args:
+        layernorm: RMSNorm 层（Llama 的 LayerNorm，实际是 RMSNorm）
+        linear_layers: 下游的 Linear 层列表（如 q_proj, k_proj, v_proj）
+    """
+    for linear in linear_layers:
+        linear_dtype = linear.weight.dtype
+
+        # 将 Linear 权重的每一行乘以对应的 RMSNorm scale
+        # W_new[i, :] = W[i, :] * rms_weight[i]
+        W_ = linear.weight.data.double()
+        linear.weight.data = (W_ * layernorm.weight.double()).to(linear_dtype)
+
+    print(f"  ✓ Fused RMSNorm scale into {len(linear_layers)} linear layers")
+
+
 class CompressedLlamaDecoderLayer(nn.Module):
     """
     压缩的 Llama Decoder Layer，包含 shortcut Q 矩阵
@@ -188,6 +218,13 @@ def compute_layer_pca_rotations_with_shortcut(
         results["embedding_Q"] = Q.cpu().numpy()
         print(f"  Embedding Q shape: {Q.shape}")
 
+        # ===== 重要：解绑 lm_head 和 embed_tokens 的权重共享 =====
+        # Llama 默认 lm_head.weight 和 embed_tokens.weight 是同一块内存（tie_word_embeddings=True）
+        # 如果不解绑，旋转 embedding 时会把 lm_head 也旋转了，导致后续再旋转 lm_head 时出错
+        print("Untying lm_head from embed_tokens...")
+        model.lm_head.weight = nn.Parameter(model.lm_head.weight.clone())
+        print("✓ lm_head.weight is now independent from embed_tokens.weight")
+
         # 旋转embedding权重
         print("Rotating embeddings...")
         Q_device = Q.to(device).to(torch.float64)
@@ -202,6 +239,29 @@ def compute_layer_pca_rotations_with_shortcut(
 
             # 将当前层移到GPU
             layer = model.model.layers[layer_idx].to(device)
+
+            # ===== 步骤0: Fuse LayerNorm 到 Linear 层 =====
+            print(f"  Step 0: Fusing LayerNorm into Linear layers...")
+
+            # Fuse input_layernorm 到 attention 输入层 (q_proj, k_proj, v_proj)
+            fuse_ln_linear(
+                layer.input_layernorm,
+                [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]
+            )
+
+            # Fuse post_attention_layernorm 到 MLP 输入层 (gate_proj, up_proj)
+            fuse_ln_linear(
+                layer.post_attention_layernorm,
+                [layer.mlp.gate_proj, layer.mlp.up_proj]
+            )
+
+            # ===== 步骤0.5: 将 RMSNorm 权重设置为 1.0 =====
+            # 重要！fuse 之后必须将权重设为 1.0，否则 gamma 会被应用两次
+            # 不替换类，保持 state_dict 兼容性
+            print(f"  Step 0.5: Setting RMSNorm weights to 1.0...")
+            torch.nn.init.ones_(layer.input_layernorm.weight)
+            torch.nn.init.ones_(layer.post_attention_layernorm.weight)
+            print(f"  ✓ Set 2 RMSNorm weights to 1.0 (gamma disabled)")
 
             # ===== 步骤1: 用上一层的Q旋转当前层的attention输入 =====
             print(f"  Step 1: Rotating attention inputs with Q from layer {layer_idx-1 if layer_idx > 0 else 'embedding'}...")
@@ -288,6 +348,19 @@ def compute_layer_pca_rotations_with_shortcut(
             # 将层移回CPU
             layer.to('cpu')
             cleanup_memory()
+
+        # ===== Fuse pre-head LayerNorm 到 lm_head =====
+        print("\n" + "="*50)
+        print("Fusing pre-head LayerNorm (model.norm) into lm_head...")
+        print("="*50)
+
+        # Llama 的最后一层 LayerNorm (model.norm)
+        fuse_ln_linear(model.model.norm, [model.lm_head])
+
+        # 将 model.norm 权重设置为 1.0（不替换类，保持兼容性）
+        print("Setting model.norm weight to 1.0...")
+        torch.nn.init.ones_(model.model.norm.weight)
+        print("✓ Set model.norm weight to 1.0 (gamma disabled)")
 
         # ===== 旋转 lm_head (Language Model Head) =====
         print("\n" + "="*50)
@@ -407,7 +480,7 @@ if __name__ == "__main__":
 
     # 保存旋转后的模型（包含 shortcut Q）
     # 模仿 SliceGPT 的保存方式：只保存 state_dict
-    save_path = "rotated_llama_model_with_shortcut_lm_head"
+    save_path = "rotated_llama_model_with_shortcut_lm_head_ln_fusion"
     print(f"\nSaving rotated model with shortcut Q to {save_path}...")
     print("Using SliceGPT-style saving method (state_dict only)...")
 
