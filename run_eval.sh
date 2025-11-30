@@ -6,11 +6,11 @@
 # 配置参数
 GPU_ID=7
 MODEL_PATH="rotated_llama_model"  # 旋转后的模型路径
-SEQLEN=2048
+SEQLEN=4096
 BATCH_SIZE=1
 
 # 运行评估
-CUDA_VISIBLE_DEVICES=$GPU_ID python eval_model_ppl.py \
+CUDA_VISIBLE_DEVICES=$GPU_ID python -u eval_model_ppl.py \
     --model-path $MODEL_PATH \
     --seqlen $SEQLEN \
     --batch-size $BATCH_SIZE \
