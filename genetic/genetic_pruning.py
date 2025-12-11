@@ -487,3 +487,92 @@ class GeneticPruning:
                 'effective_depth': individual.effective_depth
             }
         return individual
+
+    def tournament_selection(self, population: List[Individual]) -> Individual:
+        """
+        Selects an individual using tournament selection.
+        A specified number of individuals are randomly chosen from the population,
+        and the one with the best fitness (lowest PPL) is selected.
+        """
+        if len(population) < self.tournament_size:
+            raise ValueError(f"Population size ({len(population)}) is smaller than tournament size ({self.tournament_size}).")
+        
+        tournament = random.sample(population, self.tournament_size)
+        # Select the winner: lowest fitness among valid individuals, or inf if invalid
+        winner = min(tournament, key=lambda ind: ind.fitness if ind.is_valid else float('inf'))
+        return winner
+
+    def select_two_different_parents(self, population: List[Individual], percent: float = 0.2) -> Tuple[Individual, Individual]:
+        """
+        Selects two different parents from the top 'percent' of the population
+        based on fitness.
+        """
+        # Get valid individuals and sort by fitness
+        valid_pop = [ind for ind in population if ind.is_valid]
+        if len(valid_pop) < 2:
+            # If not enough valid individuals, fall back to general tournament selection for two
+            print("Warning: Not enough valid individuals for top-percent selection. Falling back to general tournament.")
+            parent1 = self.tournament_selection(population)
+            parent2 = self.tournament_selection(population)
+            while parent1 == parent2: # Ensure they are different
+                parent2 = self.tournament_selection(population)
+            return parent1, parent2
+
+        sorted_pop = sorted(valid_pop, key=lambda ind: ind.fitness)
+
+        # Select from top percent, ensuring at least 2 individuals if possible
+        top_n = max(2, int(len(sorted_pop) * percent))
+        top_individuals = sorted_pop[:top_n]
+
+        # Randomly choose two different individuals from the top group
+        if len(top_individuals) < 2:
+            # Should not happen if valid_pop >= 2 and top_n >= 2, but as a safeguard
+            print(f"Warning: Only {len(top_individuals)} individuals in top {percent*100}% group. Cannot select two distinct parents.")
+            # Fallback for extreme cases
+            parent1 = top_individuals[0]
+            parent2 = copy.deepcopy(parent1) # Return two copies of the same if no alternative
+            return parent1, parent2
+            
+        parent1, parent2 = random.sample(top_individuals, 2)
+        return parent1, parent2
+
+    def select_weighted_parents(self, population: List[Individual], percent: float = 0.6) -> Tuple[Individual, Individual]:
+        """
+        Selects two different parents from the top 'percent' of the population
+        using a weighted probability distribution based on fitness.
+        Higher fitness (lower PPL) individuals have a higher chance of being selected.
+        """
+        valid_pop = [ind for ind in population if ind.is_valid]
+        if len(valid_pop) < 2:
+            print("Warning: Not enough valid individuals for weighted selection. Falling back to general selection.")
+            return self.select_two_different_parents(population, percent=1.0) # Select from all valid
+
+        sorted_pop = sorted(valid_pop, key=lambda ind: ind.fitness)
+
+        top_n = max(2, int(len(sorted_pop) * percent))
+        top_individuals = sorted_pop[:top_n]
+
+        if len(top_individuals) < 2:
+            print(f"Warning: Only {len(top_individuals)} individuals in top {percent*100}% group for weighted selection.")
+            parent1 = top_individuals[0]
+            parent2 = copy.deepcopy(parent1)
+            return parent1, parent2
+
+        # Calculate weights: simple rank-based weighting (e.g., higher rank = higher weight)
+        # Using a linear rank-based weight: best gets N, next gets N-1, ..., worst gets 1
+        weights = [top_n - i for i in range(top_n)]
+        
+        # Select first parent
+        parent1 = random.choices(top_individuals, weights=weights, k=1)[0]
+
+        # Select second parent, ensuring it's different and recalculating weights
+        remaining_individuals = [ind for ind in top_individuals if ind != parent1]
+        if not remaining_individuals: # Should not happen if len(top_individuals) >= 2
+             parent2 = copy.deepcopy(parent1)
+             return parent1, parent2
+
+        remaining_weights = [weights[top_individuals.index(ind)] for ind in remaining_individuals]
+        
+        parent2 = random.choices(remaining_individuals, weights=remaining_weights, k=1)[0]
+        
+        return parent1, parent2
