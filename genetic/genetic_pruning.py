@@ -536,43 +536,346 @@ class GeneticPruning:
         parent1, parent2 = random.sample(top_individuals, 2)
         return parent1, parent2
 
-    def select_weighted_parents(self, population: List[Individual], percent: float = 0.6) -> Tuple[Individual, Individual]:
+    def crossover(self, parent1: Individual, parent2: Individual) -> Tuple[Individual, Individual]:
         """
-        Selects two different parents from the top 'percent' of the population
-        using a weighted probability distribution based on fitness.
-        Higher fitness (lower PPL) individuals have a higher chance of being selected.
+        Crossover with repair.
+
+        Supports multiple crossover types:
+        - 'uniform': Uniform crossover (each gene independently 50% from each parent)
+        - 'onepoint': Single-point crossover (one random cut point)
+        - 'twopoint': Two-point crossover (two random cut points)
         """
-        valid_pop = [ind for ind in population if ind.is_valid]
-        if len(valid_pop) < 2:
-            print("Warning: Not enough valid individuals for weighted selection. Falling back to general selection.")
-            return self.select_two_different_parents(population, percent=1.0) # Select from all valid
+        # Check crossover probability
+        if random.random() > self.crossover_rate:
+            return copy.deepcopy(parent1), copy.deepcopy(parent2)
 
-        sorted_pop = sorted(valid_pop, key=lambda ind: ind.fitness)
+        chrom_len = len(parent1.chromosome)
 
-        top_n = max(2, int(len(sorted_pop) * percent))
-        top_individuals = sorted_pop[:top_n]
+        if self.crossover_type == 'uniform':
+            # Uniform crossover: each gene independently 50% from each parent
+            child1_chromosome = []
+            child2_chromosome = []
 
-        if len(top_individuals) < 2:
-            print(f"Warning: Only {len(top_individuals)} individuals in top {percent*100}% group for weighted selection.")
-            parent1 = top_individuals[0]
-            parent2 = copy.deepcopy(parent1)
-            return parent1, parent2
+            for gene1, gene2 in zip(parent1.chromosome, parent2.chromosome):
+                if random.random() < 0.5:
+                    child1_chromosome.append(gene1)
+                    child2_chromosome.append(gene2)
+                else:
+                    child1_chromosome.append(gene2)
+                    child2_chromosome.append(gene1)
 
-        # Calculate weights: simple rank-based weighting (e.g., higher rank = higher weight)
-        # Using a linear rank-based weight: best gets N, next gets N-1, ..., worst gets 1
-        weights = [top_n - i for i in range(top_n)]
-        
-        # Select first parent
-        parent1 = random.choices(top_individuals, weights=weights, k=1)[0]
+        elif self.crossover_type == 'onepoint':
+            # Single-point crossover
+            if chrom_len < 2: # Cannot cut if length < 2
+                child1_chromosome = parent1.chromosome[:]
+                child2_chromosome = parent2.chromosome[:]
+            else:
+                cut_point = random.randint(1, chrom_len - 1)
+                child1_chromosome = parent1.chromosome[:cut_point] + parent2.chromosome[cut_point:]
+                child2_chromosome = parent2.chromosome[:cut_point] + parent1.chromosome[cut_point:]
 
-        # Select second parent, ensuring it's different and recalculating weights
-        remaining_individuals = [ind for ind in top_individuals if ind != parent1]
-        if not remaining_individuals: # Should not happen if len(top_individuals) >= 2
-             parent2 = copy.deepcopy(parent1)
-             return parent1, parent2
+        elif self.crossover_type == 'twopoint':
+            # Two-point crossover
+            if chrom_len < 3: # Cannot make 2 cuts if length < 3
+                child1_chromosome = parent1.chromosome[:]
+                child2_chromosome = parent2.chromosome[:]
+            else:
+                # Ensure point1 < point2
+                point1 = random.randint(1, chrom_len - 2)
+                point2 = random.randint(point1 + 1, chrom_len - 1)
 
-        remaining_weights = [weights[top_individuals.index(ind)] for ind in remaining_individuals]
-        
-        parent2 = random.choices(remaining_individuals, weights=remaining_weights, k=1)[0]
-        
-        return parent1, parent2
+                # Swap the middle segment
+                child1_chromosome = (parent1.chromosome[:point1] +
+                                    parent2.chromosome[point1:point2] +
+                                    parent1.chromosome[point2:])
+                child2_chromosome = (parent2.chromosome[:point1] +
+                                    parent1.chromosome[point1:point2] +
+                                    parent2.chromosome[point2:])
+        else:
+            raise ValueError(f"Unknown crossover type: {self.crossover_type}. Must be 'uniform', 'onepoint', or 'twopoint'.")
+
+        # Repair chromosomes to ensure they meet constraints (or at least try to)
+        child1_chromosome = self._repair_chromosome(child1_chromosome)
+        child2_chromosome = self._repair_chromosome(child2_chromosome)
+
+        child1 = Individual(chromosome=child1_chromosome)
+        child2 = Individual(chromosome=child2_chromosome)
+
+        return child1, child2
+
+    def mutate(self, individual: Individual) -> Individual:
+        """
+        Multi-value mutation with gradual transitions (loop-aware).
+
+        Mutation rules (gradual transitions only, no jumps > 1):
+        - 0 -> 1 (can only increase to 1)
+        - 1 -> 0 or 2 (can go either direction)
+        - 2~(max_loop_count-1) -> value-1 or value+1
+        - max_loop_count -> max_loop_count-1 (can only decrease by 1)
+        """
+        mutated = copy.deepcopy(individual)
+
+        for i in range(len(mutated.chromosome)):
+            if random.random() < self.mutation_rate:
+                current_value = mutated.chromosome[i]
+
+                if current_value == 0:
+                    # 0 can only mutate to 1
+                    mutated.chromosome[i] = 1
+                elif current_value == 1:
+                    # 1 can mutate to 0 or 2 (50/50)
+                    mutated.chromosome[i] = random.choice([0, 2])
+                elif current_value == self.max_loop_count:
+                    # max_loop_count can only decrease to max_loop_count-1
+                    mutated.chromosome[i] = self.max_loop_count - 1
+                else:
+                    # Middle values can increase or decrease by 1
+                    mutated.chromosome[i] = random.choice([current_value - 1, current_value + 1])
+
+        # Repair to satisfy constraints
+        mutated.chromosome = self._repair_chromosome(mutated.chromosome)
+
+        return mutated
+
+    def save_checkpoint(self, generation: int, population: List[Individual], best_ever: Individual):
+        """Save checkpoint to resume training."""
+        if not self.checkpoint_dir:
+            return
+
+        checkpoint = {
+            'generation': generation,
+            'population': [
+                {
+                    'chromosome': ind.chromosome,
+                    'fitness': ind.fitness,
+                    'params_ratio': ind.params_ratio,
+                    'is_valid': ind.is_valid,
+                    'num_modules': ind.num_modules,
+                    'effective_depth': ind.effective_depth
+                }
+                for ind in population
+            ],
+            'best_ever': {
+                'chromosome': best_ever.chromosome,
+                'fitness': best_ever.fitness,
+                'params_ratio': best_ever.params_ratio,
+                'is_valid': best_ever.is_valid,
+                'num_modules': best_ever.num_modules,
+                'effective_depth': best_ever.effective_depth
+            },
+            'evaluated_cache': {
+                str(k): v for k, v in self.evaluated_cache.items()
+            },
+            'config': {
+                'population_size': self.population_size,
+                'max_generations': self.max_generations,
+                'mutation_rate': self.mutation_rate,
+                'crossover_rate': self.crossover_rate,
+                'crossover_type': self.crossover_type,
+                'selection_method': self.selection_method,
+                'tournament_size': self.tournament_size,
+                'top_percent': self.top_percent,
+                'max_param_ratio': self.max_param_ratio,
+                'max_loop_count': self.max_loop_count,
+                'num_modules': self.num_modules,
+            }
+        }
+
+        # Create directory if it doesn't exist
+        import os
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        checkpoint_path = f"{self.checkpoint_dir}/checkpoint_gen{generation}.json"
+        with open(checkpoint_path, 'w') as f:
+            json.dump(checkpoint, f, indent=2)
+
+        print(f"  💾 Checkpoint saved: {checkpoint_path}")
+
+        # Also save as latest
+        latest_path = f"{self.checkpoint_dir}/checkpoint_latest.json"
+        with open(latest_path, 'w') as f:
+            json.dump(checkpoint, f, indent=2)
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load checkpoint to resume training."""
+        print(f"\\n📂 Loading checkpoint from: {checkpoint_path}")
+
+        with open(checkpoint_path, 'r') as f:
+            checkpoint = json.load(f)
+
+        # Restore population
+        population = []
+        for ind_data in checkpoint['population']:
+            ind = Individual(
+                chromosome=ind_data['chromosome'],
+                fitness=ind_data['fitness'],
+                params_ratio=ind_data['params_ratio'],
+                is_valid=ind_data['is_valid'],
+                num_modules=ind_data['num_modules'],
+                effective_depth=ind_data.get('effective_depth', 0)
+            )
+            population.append(ind)
+
+        # Restore best ever
+        best_data = checkpoint['best_ever']
+        best_ever = Individual(
+            chromosome=best_data['chromosome'],
+            fitness=best_data['fitness'],
+            params_ratio=best_data['params_ratio'],
+            is_valid=best_data['is_valid'],
+            num_modules=best_data['num_modules'],
+            effective_depth=best_data.get('effective_depth', 0)
+        )
+
+        # Restore cache
+        # Keys in JSON are strings, convert back to tuple of ints
+        self.evaluated_cache = {
+            eval(k): v for k, v in checkpoint['evaluated_cache'].items()
+        }
+
+        generation = checkpoint['generation']
+
+        print(f"✓ Checkpoint loaded:")
+        print(f"  Generation: {generation}")
+        print(f"  Population size: {len(population)}")
+        print(f"  Best fitness: {best_ever.fitness:.2f}")
+        print(f"  Cache size: {len(self.evaluated_cache)}")
+
+        # Note: We do NOT overwrite config from checkpoint by default, 
+        # allowing user to change parameters (e.g. mutation rate) on resume if they wish.
+        # But we warn if critical structural params match.
+        saved_config = checkpoint.get('config', {})
+        if saved_config.get('num_modules') != self.num_modules:
+            print("⚠️ Warning: Loaded checkpoint has different num_modules than current model!")
+
+        return generation, population, best_ever
+
+    def evolve(self, resume_from: str = None) -> Individual:
+        """Main genetic algorithm loop with checkpoint support."""
+        print("\\n" + "="*80)
+        print("Starting Genetic Algorithm Evolution")
+        print("="*80)
+
+        start_generation = 0
+        best_ever = None
+        population = []
+
+        # Try to resume from checkpoint
+        if resume_from:
+            start_generation, population, best_ever = self.load_checkpoint(resume_from)
+            start_generation += 1  # Start from next generation
+            print(f"\\n▶️  Resuming from generation {start_generation}")
+        else:
+            # Initialize
+            print("\\nGenerating initial population...")
+            population = self.initialize_population()
+
+            # Evaluate initial
+            print("Evaluating initial population...")
+            population = self.evaluate_fitness_batch_parallel(population)
+            
+            # Find best
+            valid_pop = [ind for ind in population if ind.is_valid]
+            if not valid_pop:
+                # Should be rare with _repair_chromosome
+                print("⚠️ No valid individuals in initial population! Picking best invalid one.")
+                best_ever = min(population, key=lambda x: x.fitness)
+            else:
+                best_ever = min(valid_pop, key=lambda x: x.fitness)
+            
+            best_ever = copy.deepcopy(best_ever) # Keep a separate copy
+            print(f"Initial best: {best_ever}")
+
+            # Save initial checkpoint
+            if self.checkpoint_dir:
+                self.save_checkpoint(0, population, best_ever)
+
+        # Evolution Loop
+        for generation in range(start_generation, self.max_generations):
+            print(f"\\n{'='*80}")
+            print(f"Generation {generation + 1}/{self.max_generations}")
+            print(f"{'='*80}")
+
+            new_population = []
+
+            # 1. Elitism: Keep current generation best
+            # Find current best valid individual
+            valid_pop = [ind for ind in population if ind.is_valid]
+            current_best = None
+            if valid_pop:
+                current_best = min(valid_pop, key=lambda x: x.fitness)
+            
+            if current_best:
+                new_population.append(copy.deepcopy(current_best))
+                print(f"  👑 Elitism: Kept best (Fitness: {current_best.fitness:.4f})")
+            else:
+                # If no valid individual, keep *something* to maintain population size
+                # Usually keep the one with lowest fitness (even if invalid) or just random
+                # Here we force keep the best invalid one hoping it mutates to valid
+                fallback_best = min(population, key=lambda x: x.fitness)
+                new_population.append(copy.deepcopy(fallback_best))
+                print(f"  ⚠️ Elitism: No valid individuals. Kept best invalid (Fitness: {fallback_best.fitness:.4f})")
+
+            # 2. Generate Offspring
+            # We need to fill population_size - len(new_population) spots
+            offspring_to_evaluate = []
+
+            while len(new_population) + len(offspring_to_evaluate) < self.population_size:
+                # Selection
+                if self.selection_method == "top20":
+                    parent1, parent2 = self.select_two_different_parents(population, percent=0.2)
+                elif self.selection_method == "topNw":
+                    parent1, parent2 = self.select_weighted_parents(population, percent=self.top_percent)
+                else:  # tournament (default)
+                    parent1 = self.tournament_selection(population)
+                    parent2 = self.tournament_selection(population)
+
+                # Crossover
+                child1, child2 = self.crossover(parent1, parent2)
+                
+                # Mutation
+                child1 = self.mutate(child1)
+                child2 = self.mutate(child2)
+
+                offspring_to_evaluate.append(child1)
+                if len(new_population) + len(offspring_to_evaluate) < self.population_size:
+                    offspring_to_evaluate.append(child2)
+
+            # 3. Evaluate Offspring
+            print(f"  🧬 Evaluating {len(offspring_to_evaluate)} offspring...")
+            offspring_to_evaluate = self.evaluate_fitness_batch_parallel(offspring_to_evaluate)
+            
+            # Add to new population
+            new_population.extend(offspring_to_evaluate)
+            
+            # Replace old population
+            population = new_population
+
+            # 4. Update Global Best
+            gen_best = min(population, key=lambda x: x.fitness if x.is_valid else float('inf'))
+            
+            if gen_best.is_valid and gen_best.fitness < best_ever.fitness:
+                print(f"  🎉 New Global Best Found! Fitness: {gen_best.fitness:.4f} (was {best_ever.fitness:.4f})")
+                best_ever = copy.deepcopy(gen_best)
+            else:
+                print(f"  Generation Best: {gen_best.fitness:.4f} (Global Best: {best_ever.fitness:.4f})")
+
+            # Stats
+            valid_count = sum(1 for ind in population if ind.is_valid)
+            avg_fitness = np.mean([ind.fitness for ind in population if ind.is_valid]) if valid_count > 0 else float('inf')
+            print(f"  Stats: Valid={valid_count}/{self.population_size}, Avg Valid Fitness={avg_fitness:.4f}")
+
+            # 5. Checkpoint
+            if self.checkpoint_dir and (generation + 1) % self.checkpoint_interval == 0:
+                self.save_checkpoint(generation + 1, population, best_ever)
+
+        print("\\n" + "="*80)
+        print("Evolution Complete!")
+        print("="*80)
+        print(f"Best Individual: {best_ever}")
+
+        # Final checkpoint
+        if self.checkpoint_dir:
+            self.save_checkpoint(self.max_generations, population, best_ever)
+
+        return best_ever
