@@ -13,11 +13,11 @@ POPULATION_SIZE=20      # 种群大小
 MUTATION_RATE=0.05      # 变异率
 CROSSOVER_RATE=0.8      # 交叉率
 CROSSOVER_TYPE="uniform" # uniform, onepoint, twopoint
-SELECTION_METHOD="tournament" # tournament, top20, topNw
+SELECTION_METHOD="topNw" # tournament, top20, topNw
 
 # 约束条件
 MAX_PARAM_RATIO=0.5     # 最大参数比例 (0.5 = 50%)
-MAX_LOOP_COUNT=2        # 最大循环次数
+MAX_LOOP_COUNT=5        # 最大循环次数
 
 # 评估参数
 EVAL_SAMPLES=128        # 每次评估使用的样本数
