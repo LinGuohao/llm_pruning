@@ -5,7 +5,7 @@
 MODEL_PATH="/gpfs/volcano/models/meta-llama/Llama-2-13b-hf"
 
 # 指定要使用的物理GPU ID列表，例如 "0,1,2,3" 或 "1,5"。
-GPU_IDS="0,1"
+GPU_IDS="0,1,3,4,6,7"
 
 # 核心遗传算法参数
 MAX_GENERATIONS=200      # 进化代数
