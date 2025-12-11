@@ -6,65 +6,12 @@ import copy
 import random
 import json
 import threading
+import numpy as np
+from datasets import load_dataset
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def decode_chromosome(chromosome: List[int]) -> List[int]:
-    """
-    Decode a loop-encoded chromosome into an execution path.
-
-    Encoding rules (updated for multi-value support):
-    - 0 = skip
-    - 1 = execute once (no loop)
-    - 2+ = execute N times (participate in loop or standalone)
-    - Consecutive identical values form a "loop block" that repeats together
-    - Different loop count values create separate blocks
-
-    Args:
-        chromosome: List[int], values in {0,1,2,...,max_loop_count}
-
-    Returns:
-        path: List[int], execution path (module indices in order)
-
-    Example:
-        [1,1,2,2,3,3,2,2] → [0,1, 2,3,2,3, 4,5,4,5,4,5, 6,7,6,7]
-        - Block 1: modules 0,1 (execute 1x)
-        - Block 2: modules 2,3 (execute 2x)
-        - Block 3: modules 4,5 (execute 3x)
-        - Block 4: modules 6,7 (execute 2x)
-    """
-    path = []
-    i = 0
-
-    while i < len(chromosome):
-        # Skip 0
-        if chromosome[i] == 0:
-            i += 1
-            continue
-
-        # Execute once (value == 1)
-        if chromosome[i] == 1:
-            path.append(i)
-            i += 1
-            continue
-
-        # Loop block - find consecutive identical values
-        if chromosome[i] >= 2:
-            current_loop_value = chromosome[i]
-            block_modules = []
-
-            # Find all consecutive positions with the exact same loop value
-            while i < len(chromosome) and chromosome[i] == current_loop_value:
-                block_modules.append(i)
-                i += 1
-
-            # Execute this specific loop block (current_loop_value) times
-            for _ in range(current_loop_value):
-                path.extend(block_modules)
-
-            # Note: If there are more positions with different loop values,
-            # they will be handled in separate blocks in the next iteration
-
-    return path
-
+# Import from our new modeling module
+from modeling import decode_chromosome, DecoupledLlamaModel
 
 @dataclass
 class Individual:
@@ -88,29 +35,102 @@ class GeneticPruning:
 
     def __init__(
         self,
-        model: nn.Module,
+        model_map: Dict[str, nn.Module], # Changed: Accept a map of device -> model instance
+        tokenizer,
+        seqlen: int = 2048,
         population_size: int = 20,
+        max_generations: int = 50,
+        mutation_rate: float = 0.05,
+        crossover_rate: float = 0.8,
+        crossover_type: str = "uniform",
+        selection_method: str = "tournament",
+        tournament_size: int = 3,
+        top_percent: float = 0.5,
         max_param_ratio: float = 0.5,
         max_loop_count: int = 2,
+        eval_samples: int = 128, 
+        checkpoint_dir: str = None,
+        checkpoint_interval: int = 10,
         seed: int = 42
     ):
-        self.model = model
+        if not model_map:
+            raise ValueError("model_map cannot be empty")
+        
+        self.model_map = model_map
+        self.devices = list(model_map.keys())
+        self.device = self.devices[0] # Primary device (e.g. for main thread ops)
+        self.primary_model = self.model_map[self.device]
+        
+        self.use_multi_gpu = len(self.devices) > 1
+        
+        self.tokenizer = tokenizer
+        self.seqlen = seqlen
+        
+        # Load and prepare WikiText2 data exactly like SliceGPT
+        print("Loading WikiText2 validation/test data for evaluation...")
+        self.eval_data = self._get_wikitext2_data(tokenizer, seqlen)
+        print(f"Prepared {self.eval_data.shape[0]} samples of length {seqlen}")
+
         self.population_size = population_size
+        self.max_generations = max_generations
+        self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
+        self.crossover_type = crossover_type
+        self.selection_method = selection_method
+        self.tournament_size = tournament_size
+        self.top_percent = top_percent
         self.max_param_ratio = max_param_ratio
         self.max_loop_count = max_loop_count
-        
+        self.eval_samples = min(eval_samples, self.eval_data.shape[0])
+
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_interval = checkpoint_interval
+
         # Hardcoded for Llama-13B structure
         self.num_layers = 40 
         self.num_modules = 80  # 40 Attention + 40 FFN
         
-        # Calculate parameters (needed for ratio constraint)
-        self.fixed_params, self.module_params, self.original_params = self._analyze_model_params(model)
+        # Calculate parameters (needed for ratio constraint) using primary model
+        self.fixed_params, self.module_params, self.original_params = self._analyze_model_params(self.primary_model)
+
+        # Cache for evaluated chromosomes (thread-safe)
+        self.evaluated_cache = {}
+        self.cache_lock = threading.Lock()
 
         print(f"Genetic Pruning Initialized (Llama-13B Mode):")
         print(f"  Total modules: {self.num_modules}")
         print(f"  Target param ratio: ≤{max_param_ratio:.0%}")
         print(f"  Max loop count: {max_loop_count}")
         print(f"  Population size: {population_size}")
+        print(f"  Max generations: {max_generations}")
+        print(f"  Mutation rate: {mutation_rate}")
+        print(f"  Crossover rate: {crossover_rate}")
+        print(f"  Devices: {self.devices}")
+        if self.use_multi_gpu:
+            print(f"  Multi-GPU: ENABLED ({len(self.devices)} GPUs, parallel evaluation)")
+
+    def _get_wikitext2_data(self, tokenizer, seqlen):
+        """
+        Load and prepare WikiText2 dataset.
+        Identical logic to SliceGPT/eval_model_ppl.py: get_wikitext2 + reshaping
+        """
+        # Load dataset (using 'test' split as per SliceGPT example, 
+        # but for evolution usually 'validation' is safer to avoid overfitting to test.
+        # However, to be "strictly consistent" with the reference file provided:
+        testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        
+        # Join all text
+        text = "\n\n".join(testdata['text'])
+        
+        # Tokenize
+        testenc = tokenizer(text, return_tensors='pt')
+        
+        # Reshape into chunks of seqlen
+        nsamples = testenc.input_ids.numel() // seqlen
+        input_ids = testenc.input_ids[0, :nsamples * seqlen]
+        input_ids = input_ids.reshape(nsamples, seqlen)
+        
+        return input_ids
 
     def _analyze_model_params(self, model: nn.Module) -> Tuple[int, List[int], int]:
         """
@@ -118,8 +138,6 @@ class GeneticPruning:
         Assumes HF LlamaForCausalLM structure.
         """
         # Fixed params: Embeddings + Norm + Head
-        # Note: Depending on implementation, embed_tokens might be tied to lm_head.
-        # We count them as fixed costs.
         fixed_params = sum(p.numel() for p in model.model.embed_tokens.parameters())
         fixed_params += sum(p.numel() for p in model.model.norm.parameters())
         fixed_params += sum(p.numel() for p in model.lm_head.parameters())
@@ -146,8 +164,6 @@ class GeneticPruning:
 
     def _calculate_params_ratio(self, chromosome: List[int]) -> float:
         """Calculate parameter ratio based on unique modules selected."""
-        # Only count parameters for modules that have value > 0
-        # Loops do NOT add extra parameter cost (weight sharing)
         selected_params = sum(
             self.module_params[i] for i, value in enumerate(chromosome) if value > 0
         )
@@ -184,28 +200,24 @@ class GeneticPruning:
         population = []
 
         # Strategy 1: Full Model (Baseline)
-        # Usually full model is > max_ratio, so this will effectively produce 
-        # a "maximally filled" individual satisfying the constraint.
         chromosome = [1] * self.num_modules
         chromosome = self._repair_chromosome(chromosome)
         population.append(Individual(chromosome=chromosome))
 
         # Strategy 2: Strided Pruning (Uniform Sparsity)
-        # Keep every 2nd, 3rd, 4th, 5th module
         for k in [2, 3, 4, 5]:
             chromosome = [1 if i % k == 0 else 0 for i in range(self.num_modules)]
             chromosome = self._repair_chromosome(chromosome)
             population.append(Individual(chromosome=chromosome))
 
         # Strategy 3: Structure-Aware Pruning (Attention vs FFN)
-        # Since we have 80 modules, Evens=Attention, Odds=FFN
+        # Evens=Attention, Odds=FFN
         
         # Sub-strategy 3A: Keep Attention, Sample FFN
         for keep_ffn_ratio in [0.2, 0.4, 0.6]:
             chromosome = []
             for i in range(self.num_modules):
                 if i % 2 == 0: # Attention
-                    # Mostly keep Attn, occasional loop
                     val = random.randint(1, self.max_loop_count) if random.random() < 0.2 else 1
                     chromosome.append(val)
                 else: # FFN
@@ -228,19 +240,16 @@ class GeneticPruning:
                     else:
                         chromosome.append(0)
                 else: # FFN
-                     # Mostly keep FFN
                      val = random.randint(1, self.max_loop_count) if random.random() < 0.2 else 1
                      chromosome.append(val)
             chromosome = self._repair_chromosome(chromosome)
             population.append(Individual(chromosome=chromosome))
 
         # Strategy 4: Random Density Fill
-        # Fill remaining population slots with randomized chromosomes
         while len(population) < self.population_size:
             chromosome = []
             for _ in range(self.num_modules):
                 r = random.random()
-                # Bias towards sparsity (0) to hit constraints faster
                 if r < 0.5: # 50% Skip
                     chromosome.append(0)
                 elif r < 0.8: # 30% Keep Once
@@ -253,3 +262,228 @@ class GeneticPruning:
 
         print(f"✓ Initialized population of {len(population)} individuals")
         return population
+
+    def _evaluate_ppl_on_device(self, chromosome: List[int], device: str) -> float:
+        """
+        Evaluate perplexity for a chromosome on a specific device using DecoupledLlamaModel.
+        Strictly follows logic from SliceGPT/eval_model_ppl.py (evaluate_ppl_simple).
+        """
+        try:
+            # Get the model for this specific device
+            original_model = self.model_map[device]
+            decoupled_model = DecoupledLlamaModel(
+                original_model,
+                chromosome
+            )
+            decoupled_model.eval()
+        except Exception as e:
+            print(f"    Error building DecoupledLlamaModel on {device}: {e}")
+            torch.cuda.empty_cache()
+            raise
+
+        loss_fct = nn.CrossEntropyLoss().to(device)
+        acc_loss = 0.0
+        
+        # Use a subset of samples if specified, otherwise full data
+        nsamples = self.eval_samples
+        
+        # Get data subset
+        input_ids_all = self.eval_data[:nsamples]
+
+        with torch.no_grad():
+            for i in range(nsamples):
+                try:
+                    # Get single sample (1, seqlen)
+                    input_ids = input_ids_all[i:i+1].to(device)
+
+                    # Forward pass
+                    # Note: DecoupledLlamaModel forward returns logits directly
+                    logits = decoupled_model(input_ids)
+                    
+                    # Shift logits and labels
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = input_ids[:, 1:].contiguous()
+
+                    # Compute loss
+                    loss = loss_fct(
+                        shift_logits.view(-1, shift_logits.size(-1)), 
+                        shift_labels.view(-1)
+                    )
+                    
+                    acc_loss += loss.item()
+
+                except Exception as e:
+                    print(f"    Error in evaluation sample {i} on {device}: {e}")
+                    raise
+
+        # Compute average loss and PPL
+        # Logic: avg_loss = acc_loss / nsamples; PPL = exp(avg_loss)
+        avg_loss = acc_loss / nsamples
+        ppl = np.exp(avg_loss)
+
+        # Cleanup
+        del decoupled_model
+        torch.cuda.empty_cache()
+
+        return float(ppl)
+
+    def evaluate_fitness(self, individual: Individual) -> Individual:
+        """
+        Evaluate fitness (PPL) for an individual.
+        Updates individual's fitness, params_ratio, is_valid, num_modules, effective_depth.
+        """
+        chromosome_tuple = tuple(individual.chromosome)
+        with self.cache_lock:
+            if chromosome_tuple in self.evaluated_cache:
+                cached = self.evaluated_cache[chromosome_tuple]
+                individual.fitness = cached['fitness']
+                individual.params_ratio = cached['params_ratio']
+                individual.is_valid = cached['is_valid']
+                individual.num_modules = cached['num_modules']
+                individual.effective_depth = cached['effective_depth']
+                return individual
+
+        # Calculate stats (num_modules, effective_depth)
+        unique_modules_count = sum(1 for v in individual.chromosome if v > 0)
+        execution_path = decode_chromosome(individual.chromosome)
+        effective_depth = len(execution_path)
+
+        individual.num_modules = unique_modules_count
+        individual.effective_depth = effective_depth
+        
+        # Calculate params ratio
+        params_ratio = self._calculate_params_ratio(individual.chromosome)
+        individual.params_ratio = params_ratio
+
+        # Check constraint and evaluate PPL if valid
+        if params_ratio > self.max_param_ratio or unique_modules_count == 0:
+            individual.is_valid = False
+            individual.fitness = float('inf') # Invalid individuals get infinite PPL
+        else:
+            individual.is_valid = True
+            try:
+                ppl = self._evaluate_ppl_on_device(individual.chromosome, self.device)
+                individual.fitness = ppl
+            except Exception as e:
+                print(f"    ⚠️  Evaluation failed for chromosome {individual.chromosome[:10]}...: {e}")
+                individual.fitness = float('inf')
+                individual.is_valid = False
+
+        # Cache result
+        with self.cache_lock:
+            self.evaluated_cache[chromosome_tuple] = {
+                'fitness': individual.fitness,
+                'params_ratio': individual.params_ratio,
+                'is_valid': individual.is_valid,
+                'num_modules': individual.num_modules,
+                'effective_depth': individual.effective_depth
+            }
+
+        return individual
+
+    def evaluate_fitness_batch_parallel(self, individuals: List[Individual]) -> List[Individual]:
+        """
+        Evaluate fitness for multiple individuals in parallel across GPUs.
+        """
+        if not self.use_multi_gpu or len(individuals) == 0:
+            # Fallback to sequential if single GPU or empty list
+            return [self.evaluate_fitness(ind) for ind in individuals]
+
+        # Use ThreadPoolExecutor to run evaluations in parallel
+        # Each thread gets a dedicated GPU (round-robin assignment)
+        num_gpus = len(self.devices)
+        
+        # We need to explicitly deepcopy the original_model for each worker
+        # if the original_model is not already on a device that can be shared.
+        # However, DecoupledLlamaModel is designed to reference.
+        # For true parallel PPL evaluation on different GPUs, each worker usually needs
+        # its own model instance on its dedicated device.
+        # But DecoupledLlamaModel references *sub-modules* of original_model.
+        # This implies original_model's sub-modules are already on different devices OR
+        # DecoupledLlamaModel is created on each device and fetches the sub-modules to that device.
+
+        # The current DecoupledLlamaModel implementation assumes original_model's sub-modules
+        # are managed externally (e.g., already `to(device)`).
+        # For multi-GPU, the typical pattern is to put the *original_model* onto `device_map="auto"`
+        # or load it per device.
+        # Here, we will make `_evaluate_ppl_on_device` handle the `to(device)` for inputs,
+        # and `DecoupledLlamaModel` will implicitly use the original model's components as they are.
+
+        # Separating cached and uncached individuals to avoid redundant computation
+        uncached_individuals = []
+        # Store (individual, original_index) tuples
+        uncached_with_indices = []
+
+        for idx, individual in enumerate(individuals):
+            chromosome_tuple = tuple(individual.chromosome)
+            with self.cache_lock:
+                if chromosome_tuple in self.evaluated_cache:
+                    # Load from cache
+                    cached = self.evaluated_cache[chromosome_tuple]
+                    individual.fitness = cached['fitness']
+                    individual.params_ratio = cached['params_ratio']
+                    individual.is_valid = cached['is_valid']
+                    individual.num_modules = cached['num_modules']
+                    individual.effective_depth = cached['effective_depth']
+                else:
+                    uncached_individuals.append(individual)
+                    uncached_with_indices.append((individual, idx))
+
+        # If all individuals are cached, return the list as is
+        if not uncached_individuals:
+            return individuals
+
+        # Now evaluate uncached ones
+        with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+            futures = {}
+            for i, (individual, original_idx) in enumerate(uncached_with_indices):
+                device = self.devices[i % num_gpus] # Round-robin assignment
+                future = executor.submit(self._evaluate_single_individual_for_parallel, individual, device)
+                futures[future] = original_idx # Map future to original index
+
+            for future in as_completed(futures):
+                evaluated_individual = future.result()
+                original_idx = futures[future]
+                # Update the original list at its correct position
+                individuals[original_idx] = evaluated_individual
+
+        return individuals
+
+    def _evaluate_single_individual_for_parallel(self, individual: Individual, device: str) -> Individual:
+        """Helper to evaluate a single individual, to be run in a thread."""
+        chromosome_tuple = tuple(individual.chromosome)
+        
+        # Recalculate stats as they might not be set for uncached individuals
+        unique_modules_count = sum(1 for v in individual.chromosome if v > 0)
+        execution_path = decode_chromosome(individual.chromosome)
+        effective_depth = len(execution_path)
+
+        individual.num_modules = unique_modules_count
+        individual.effective_depth = effective_depth
+
+        params_ratio = self._calculate_params_ratio(individual.chromosome)
+        individual.params_ratio = params_ratio
+
+        if params_ratio > self.max_param_ratio or unique_modules_count == 0:
+            individual.is_valid = False
+            individual.fitness = float('inf')
+        else:
+            individual.is_valid = True
+            try:
+                ppl = self._evaluate_ppl_on_device(individual.chromosome, device)
+                individual.fitness = ppl
+            except Exception as e:
+                print(f"    ⚠️  Evaluation failed for chromosome {individual.chromosome[:10]}... on {device}: {e}")
+                individual.fitness = float('inf')
+                individual.is_valid = False
+        
+        # Cache result (thread-safe)
+        with self.cache_lock:
+            self.evaluated_cache[chromosome_tuple] = {
+                'fitness': individual.fitness,
+                'params_ratio': individual.params_ratio,
+                'is_valid': individual.is_valid,
+                'num_modules': individual.num_modules,
+                'effective_depth': individual.effective_depth
+            }
+        return individual
