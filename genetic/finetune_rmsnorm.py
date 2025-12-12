@@ -87,11 +87,25 @@ def evaluate_ppl(model, eval_data, device, max_samples=128):
     total_loss = 0.0
     num_samples = min(max_samples, eval_data.shape[0])
 
+    loss_fct = nn.CrossEntropyLoss()
+
     with torch.no_grad():
         for i in range(num_samples):
             input_ids = eval_data[i:i+1].to(device)
-            outputs = model(input_ids, labels=input_ids)
-            total_loss += outputs.loss.item()
+
+            # DecoupledLlamaModel only returns logits
+            logits = model(input_ids)
+
+            # Shift logits and labels for language modeling
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            # Calculate loss
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+            total_loss += loss.item()
 
     avg_loss = total_loss / num_samples
     ppl = np.exp(avg_loss)
@@ -229,8 +243,19 @@ def main():
             batch = train_data_shuffled[start_idx:end_idx].to(device)
 
             # Forward
-            outputs = model(batch, labels=batch)
-            loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
+            logits = model(batch)
+
+            # Shift logits and labels for language modeling
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = batch[:, 1:].contiguous()
+
+            # Calculate loss
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+            loss = loss / GRADIENT_ACCUMULATION_STEPS
 
             # Backward
             loss.backward()

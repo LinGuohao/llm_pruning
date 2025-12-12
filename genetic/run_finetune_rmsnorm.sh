@@ -5,14 +5,14 @@
 MODEL_PATH="/gpfs/volcano/models/meta-llama/Llama-2-13b-hf"
 
 # 最佳个体JSON文件路径 (修改这个!)
-CHROMOSOME_PATH="genetic/checkpoints/20250312-143022/best_individual.json"
+CHROMOSOME_PATH="/data/algorithm/linguohao/nas/llm_pruning/genetic/checkpoints/20251211-230928/best_individual.json"
 
 # 使用的GPU ID
-GPU_ID="0"
+GPU_ID="1"
 
 # 训练参数
 MAX_STEPS=1000          # 最大训练步数
-BATCH_SIZE=4            # 批大小
+BATCH_SIZE=100            # 批大小
 LEARNING_RATE=0.0001    # 学习率 (1e-4)
 WARMUP_STEPS=100        # 预热步数
 GRADIENT_ACCUM=1        # 梯度累积步数
