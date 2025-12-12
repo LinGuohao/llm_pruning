@@ -1,69 +1,65 @@
 #!/bin/bash
 
-# Evaluate the best individual found by genetic algorithm
-# Usage: ./genetic/run_eval_best.sh <path_to_best_individual.json> [gpu_id]
+# --- Configuration ---
+# 模型路径
+MODEL_PATH="/gpfs/volcano/models/meta-llama/Llama-2-13b-hf"
 
-# Check if best_individual.json path is provided
-if [ -z "$1" ]; then
-    echo "Usage: $0 <path_to_best_individual.json> [gpu_id]"
-    echo ""
-    echo "Example:"
-    echo "  $0 genetic/checkpoints/20240315-123456/best_individual.json 0"
-    echo ""
-    echo "If gpu_id is not provided, will use GPU 0 by default"
-    exit 1
-fi
+# 最佳个体JSON文件路径 (修改这个!)
+BEST_INDIVIDUAL_PATH="genetic/checkpoints/20250312-143022/best_individual.json"
 
-BEST_INDIVIDUAL_PATH=$1
-GPU_ID=${2:-0}  # Default to GPU 0 if not specified
+# 使用的GPU ID
+GPU_ID="0"
 
-# Check if file exists
-if [ ! -f "$BEST_INDIVIDUAL_PATH" ]; then
-    echo "Error: File not found: $BEST_INDIVIDUAL_PATH"
-    exit 1
-fi
+# 评估参数
+EVAL_SAMPLES=128        # 评估样本数
+SEQLEN=2048             # 序列长度
 
-# Model path (change this to your actual model path)
-MODEL_PATH="/path/to/your/Llama-2-13b-hf"
+# 结果保存路径 (可选，留空则自动保存在best_individual.json同目录下)
+OUTPUT_PATH=""
 
-# Check if MODEL_PATH exists, if not, try to find it from run_evolution.sh
-if [ ! -d "$MODEL_PATH" ]; then
-    echo "Warning: MODEL_PATH not set correctly in run_eval_best.sh"
-    echo "Please edit the script and set MODEL_PATH to your Llama-2-13b model path"
-    echo ""
-    echo "Trying to extract model path from run_evolution.sh..."
-
-    if [ -f "genetic/run_evolution.sh" ]; then
-        EXTRACTED_PATH=$(grep "MODEL_PATH=" genetic/run_evolution.sh | head -1 | cut -d'=' -f2 | tr -d '"')
-        if [ -n "$EXTRACTED_PATH" ] && [ -d "$EXTRACTED_PATH" ]; then
-            MODEL_PATH=$EXTRACTED_PATH
-            echo "Found model path: $MODEL_PATH"
-        else
-            echo "Could not find valid model path in run_evolution.sh"
-            exit 1
-        fi
-    else
-        echo "run_evolution.sh not found"
-        exit 1
-    fi
-fi
+# --- Script Logic ---
 
 echo "=========================================="
 echo "Evaluating Best Individual"
 echo "=========================================="
-echo "Best individual file: $BEST_INDIVIDUAL_PATH"
-echo "Model path: $MODEL_PATH"
-echo "GPU ID: $GPU_ID"
+echo "Best individual file: ${BEST_INDIVIDUAL_PATH}"
+echo "Model path: ${MODEL_PATH}"
+echo "GPU ID: ${GPU_ID}"
+echo "Eval samples: ${EVAL_SAMPLES}"
+echo "Sequence length: ${SEQLEN}"
 echo "=========================================="
 echo ""
 
-# Run evaluation
-python genetic/eval_best_individual.py \
-    --model_path "$MODEL_PATH" \
-    --best_individual_path "$BEST_INDIVIDUAL_PATH" \
-    --gpu_id "$GPU_ID" \
-    --seqlen 2048 \
-    --eval_samples 128
+# 检查文件是否存在
+if [ ! -f "$BEST_INDIVIDUAL_PATH" ]; then
+    echo "Error: Best individual file not found: $BEST_INDIVIDUAL_PATH"
+    echo "Please edit run_eval_best.sh and set BEST_INDIVIDUAL_PATH to the correct path"
+    exit 1
+fi
+
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "Error: Model path not found: $MODEL_PATH"
+    echo "Please edit run_eval_best.sh and set MODEL_PATH to the correct path"
+    exit 1
+fi
+
+# 构建命令
+CMD="python genetic/eval_best_individual.py \
+    --model_path \"${MODEL_PATH}\" \
+    --best_individual_path \"${BEST_INDIVIDUAL_PATH}\" \
+    --gpu_id \"${GPU_ID}\" \
+    --seqlen ${SEQLEN} \
+    --eval_samples ${EVAL_SAMPLES}"
+
+if [ -n "$OUTPUT_PATH" ]; then
+    CMD="$CMD --output_path \"${OUTPUT_PATH}\""
+fi
+
+# 执行命令
+echo "Running command:"
+echo "$CMD"
+echo ""
+eval $CMD
 
 echo ""
 echo "=========================================="
