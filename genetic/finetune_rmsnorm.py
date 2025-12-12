@@ -102,27 +102,23 @@ def evaluate_ppl(model, eval_data, device, max_samples=128):
 
 def main():
     # ==================== Configuration ====================
-    # Model and data paths
-    MODEL_PATH = "/gpfs/volcano/models/meta-llama/Llama-2-13b-hf"
-    CHROMOSOME_PATH = "genetic/checkpoints/20250312-143022/best_individual.json"
-    OUTPUT_DIR = "genetic/outputs/rmsnorm_tuned"
+    # Read from environment variables (set by run_finetune_rmsnorm.sh)
+    MODEL_PATH = os.getenv("FT_MODEL_PATH", "/gpfs/volcano/models/meta-llama/Llama-2-13b-hf")
+    CHROMOSOME_PATH = os.getenv("FT_CHROMOSOME_PATH", "genetic/checkpoints/20250312-143022/best_individual.json")
+    OUTPUT_DIR = os.getenv("FT_OUTPUT_DIR", "genetic/outputs/rmsnorm_tuned")
+    GPU_ID = os.getenv("FT_GPU_ID", "0")
 
-    # GPU config
-    GPU_ID = "0"
+    MAX_STEPS = int(os.getenv("FT_MAX_STEPS", "1000"))
+    BATCH_SIZE = int(os.getenv("FT_BATCH_SIZE", "4"))
+    LEARNING_RATE = float(os.getenv("FT_LEARNING_RATE", "0.0001"))
+    WARMUP_STEPS = int(os.getenv("FT_WARMUP_STEPS", "100"))
+    GRADIENT_ACCUMULATION_STEPS = int(os.getenv("FT_GRADIENT_ACCUM", "1"))
 
-    # Training config
-    MAX_STEPS = 1000
-    BATCH_SIZE = 4
-    LEARNING_RATE = 1e-4
-    WARMUP_STEPS = 100
-    GRADIENT_ACCUMULATION_STEPS = 1
-
-    # Data config
-    SEQLEN = 2048
-    NUM_TRAIN_SAMPLES = 5000  # 0 = use all
-    EVAL_SAMPLES = 128
-    EVAL_INTERVAL = 50
-    SAVE_INTERVAL = 200
+    SEQLEN = int(os.getenv("FT_SEQLEN", "2048"))
+    NUM_TRAIN_SAMPLES = int(os.getenv("FT_NUM_TRAIN_SAMPLES", "5000"))
+    EVAL_SAMPLES = int(os.getenv("FT_EVAL_SAMPLES", "128"))
+    EVAL_INTERVAL = int(os.getenv("FT_EVAL_INTERVAL", "50"))
+    SAVE_INTERVAL = int(os.getenv("FT_SAVE_INTERVAL", "200"))
 
     # ==================== Setup ====================
     os.makedirs(OUTPUT_DIR, exist_ok=True)
