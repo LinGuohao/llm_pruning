@@ -1,0 +1,54 @@
+✦ 基于我们刚才的深度探讨，以及目前的现状（PPL 34，目标 SOTA），可行的下一步思路应该集中在“低成本的权重适应”上，作为 GA
+  的补充。
+
+  以下是按优先级排序的三个具体思路：
+
+  思路一：引入“后处理微调 (Post-GA Fine-tuning)”（最稳妥，冲 SOTA 必选）
+
+  这是目前工业界和学术界最标准的做法。不要指望 GA 一步到位。
+
+   1. GA 阶段：保持现状。利用 GA 的搜索能力，在不改权重的情况下，找到一个“最具潜力的骨架”（Top-1
+      Chromosome）。这个骨架虽然现在的 PPL 是 34，但它可能是最适合“被修复”的结构。
+   2. 微调阶段：拿到这个骨架（剪枝后的模型）后，进行少量的微调。
+       * LoRA (Low-Rank Adaptation)：只训练极少量的参数（比如占总参数的 0.1%）。这将极大地缓解分布偏移。
+       * LayerNorm Tuning：如果 LoRA 都嫌重，只微调所有 LayerNorm 的 weight 和
+         bias。这几乎没有计算成本，但对纠正均值/方差偏移非常有效。
+
+  具体行动：
+   * 跑完现在的 GA。
+   * 写一个脚本 finetune_pruned_model.py，加载 GA 找到的最佳染色体，冻结大部分参数，用 LoRA 或仅 Norm 跑几个 epoch 的
+     calibration（用 WikiText-2 的 train set）。这很可能把 PPL 从 34 拉到 15 甚至 10 以下。
+
+  思路二：在 GA 中引入“极简校准” (Cost-effective Calibration)
+
+  如果你希望 GA 搜索过程中就能感知到权重的适应性（即找到“最好修”的架构，而不仅仅是“不修时最好”的架构）。
+
+   1. 方法：在 evaluate_fitness 里，不直接跑 PPL。
+   2. 校准：对于每个个体，先用 10-20 个 batch 的数据，快速更新一下所有的 LayerNorm 参数（使用 SGD）。
+   3. 评估：用更新后的 LayerNorm 参数测 PPL。
+   4. 代价：评估时间会增加（因为多了反向传播），但不需要全量微调，只动 Norm 参数很快。
+
+  具体行动：
+   * 修改 genetic/genetic_pruning.py 的 _evaluate_ppl_on_device，在计算 PPL 之前，先加入一个小的 train_loop。
+
+  思路三：SliceGPT + GA 的混合（难度大，创新性强）
+
+  既然 SliceGPT 的旋转不是最优的，GA 可以搜索“在哪里旋转”。
+
+   1. 染色体含义变化：基因不再是 0/1/2，而是：
+       * 0: Skip。
+       * 1: Keep。
+       * 2: Merge w/ Rotation (尝试用 SliceGPT 的方法把这一层和上一层融合)。
+   2. 评估：遇到 2 时，现场计算局部 PCA 旋转矩阵并应用。
+   3. 难点：PCA 计算慢，可能需要极度简化的 PCA 近似算法。
+
+  ---
+
+  我的建议（Actionable Advice）
+
+  先做“思路一”。这是性价比最高的路径。
+
+   1. Run GA：让我们先把现在写好的代码跑起来，等到它收敛，拿到一个 best_individual。
+   2. Build Finetuner：在等待 GA 跑的时候，我帮你写一个 LoRA / LayerNorm 微调脚本。
+   3. Verify：等 GA 跑完，用这个微调脚本跑一下最佳个体，看看 PPL 能降多少。如果能降到 10-15，那我们就成功了（证明了 GA +
+      轻量微调 > 暴力剪枝）。
