@@ -124,7 +124,7 @@ def main():
 
     MAX_STEPS = int(os.getenv("FT_MAX_STEPS", "1000"))
     BATCH_SIZE = int(os.getenv("FT_BATCH_SIZE", "4"))
-    LEARNING_RATE = float(os.getenv("FT_LEARNING_RATE", "0.0001"))
+    LEARNING_RATE = float(os.getenv("FT_LEARNING_RATE", "5e-6")) # Changed default LR to be smaller
     WARMUP_STEPS = int(os.getenv("FT_WARMUP_STEPS", "100"))
     GRADIENT_ACCUMULATION_STEPS = int(os.getenv("FT_GRADIENT_ACCUM", "1"))
 
@@ -167,11 +167,12 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model
+    # Load model in FP32 for maximum training stability
     print(f"Loading model (this may take a few minutes)...")
+    print(f"Using FP32 (float32) for maximum numerical stability during training...")
     base_model = LlamaForCausalLM.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.float32,  # FP32 for stability
         device_map=device,
         low_cpu_mem_usage=True
     )
@@ -200,7 +201,7 @@ def main():
         [p for p in model.parameters() if p.requires_grad],
         lr=LEARNING_RATE,
         betas=(0.9, 0.95),
-        weight_decay=0.01
+        weight_decay=0.0 # Set weight_decay to 0.0 for RMSNorm weights
     )
 
     # Evaluate before training
@@ -223,6 +224,9 @@ def main():
 
     num_samples = train_data.shape[0]
     num_batches = (num_samples + BATCH_SIZE - 1) // BATCH_SIZE
+
+    # Create loss function once
+    loss_fct = nn.CrossEntropyLoss()
 
     epoch = 0
     while global_step < MAX_STEPS:
@@ -250,11 +254,13 @@ def main():
             shift_labels = batch[:, 1:].contiguous()
 
             # Calculate loss
-            loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1)
             )
+            
+            current_loss_item = loss.item() # Capture loss item before division
+
             loss = loss / GRADIENT_ACCUMULATION_STEPS
 
             # Backward
@@ -262,14 +268,35 @@ def main():
 
             # Update
             if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                # Gradient clipping to prevent explosion
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_norm=1.0 # Max norm for gradient clipping
+                )
+
                 optimizer.step()
                 optimizer.zero_grad()
 
                 global_step += 1
 
-                # Print progress
+                # Print progress and check for NaN/Inf
                 if global_step % 10 == 0:
-                    print(f"Step {global_step}/{MAX_STEPS} | Loss: {loss.item() * GRADIENT_ACCUMULATION_STEPS:.4f}", flush=True)
+                    if torch.isnan(torch.tensor(current_loss_item)) or torch.isinf(torch.tensor(current_loss_item)):
+                        print(f"ERROR: Step {global_step}/{MAX_STEPS} | Loss is NaN/Inf! Stopping training.", flush=True)
+                        
+                        # Get current logits stats
+                        last_logits_min, last_logits_max, last_logits_mean = float('nan'), float('nan'), float('nan')
+                        if not (torch.isnan(logits).any() or torch.isinf(logits).any()):
+                            last_logits_min, last_logits_max, last_logits_mean = logits.min().item(), logits.max().item(), logits.mean().item()
+                        
+                        print(f"Last logits stats: min={last_logits_min:.4f}, max={last_logits_max:.4f}, mean={last_logits_mean:.4f}")
+                        
+                        # Check RMSNorm parameters for NaN/Inf
+                        for name, param in model.named_parameters():
+                            if param.requires_grad and (torch.isnan(param).any() or torch.isinf(param).any()):
+                                print(f"  NaN/Inf detected in parameter: {name}")
+                        return
+                    print(f"Step {global_step}/{MAX_STEPS} | Loss: {current_loss_item:.4f}", flush=True)
 
                 # Evaluate
                 if global_step % EVAL_INTERVAL == 0:
@@ -378,7 +405,6 @@ def main():
     print(f"  - Best model: best_rmsnorm.pt (PPL: {best_ppl:.4f})")
     print(f"  - Final model: final_rmsnorm.pt (PPL: {final_ppl:.4f})")
     print(f"  - Summary: training_summary.json")
-
 
 if __name__ == "__main__":
     main()

@@ -12,8 +12,8 @@ GPU_ID="1"
 
 # 训练参数
 MAX_STEPS=1000          # 最大训练步数
-BATCH_SIZE=100            # 批大小
-LEARNING_RATE=0.0001    # 学习率 (1e-4)
+BATCH_SIZE=4            # 批大小
+LEARNING_RATE=0.00001    # 学习率 (1e-4)
 WARMUP_STEPS=100        # 预热步数
 GRADIENT_ACCUM=1        # 梯度累积步数
 
