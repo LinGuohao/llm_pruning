@@ -121,10 +121,11 @@ def main():
     CHROMOSOME_PATH = os.getenv("FT_CHROMOSOME_PATH", "genetic/checkpoints/20250312-143022/best_individual.json")
     OUTPUT_DIR = os.getenv("FT_OUTPUT_DIR", "genetic/outputs/rmsnorm_tuned")
     GPU_ID = os.getenv("FT_GPU_ID", "0")
+    RESUME_FROM = os.getenv("FT_RESUME_FROM", "")  # Path to checkpoint to resume from
 
     MAX_STEPS = int(os.getenv("FT_MAX_STEPS", "1000"))
     BATCH_SIZE = int(os.getenv("FT_BATCH_SIZE", "4"))
-    LEARNING_RATE = float(os.getenv("FT_LEARNING_RATE", "5e-6")) # Changed default LR to be smaller
+    LEARNING_RATE = float(os.getenv("FT_LEARNING_RATE", "0.00001"))
     WARMUP_STEPS = int(os.getenv("FT_WARMUP_STEPS", "100"))
     GRADIENT_ACCUMULATION_STEPS = int(os.getenv("FT_GRADIENT_ACCUM", "1"))
 
@@ -201,17 +202,43 @@ def main():
         [p for p in model.parameters() if p.requires_grad],
         lr=LEARNING_RATE,
         betas=(0.9, 0.95),
-        weight_decay=0.0 # Set weight_decay to 0.0 for RMSNorm weights
+        weight_decay=0.0
     )
 
-    # Evaluate before training
-    print(f"\n{'='*60}")
-    print(f"Evaluation BEFORE training")
-    print(f"{'='*60}")
-    initial_ppl, initial_loss = evaluate_ppl(model, eval_data, device, EVAL_SAMPLES)
-    print(f"Initial PPL: {initial_ppl:.4f}")
-    print(f"Initial Loss: {initial_loss:.6f}")
-    print(f"{'='*60}\n")
+    # Resume from checkpoint if specified
+    start_step = 0
+    if RESUME_FROM and os.path.exists(RESUME_FROM):
+        print(f"\n{'='*60}")
+        print(f"Resuming from checkpoint: {RESUME_FROM}")
+        print(f"{'='*60}")
+        checkpoint = torch.load(RESUME_FROM, map_location=device)
+
+        # Load RMSNorm weights
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in checkpoint['rmsnorm_weights']:
+                param.data.copy_(checkpoint['rmsnorm_weights'][name].to(device))
+
+        # Load optimizer state
+        if 'optimizer' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+
+        start_step = checkpoint.get('step', 0)
+        best_ppl = checkpoint.get('ppl', float('inf'))
+        initial_ppl = checkpoint.get('initial_ppl', best_ppl)
+
+        print(f"Resumed from step {start_step}")
+        print(f"Best PPL so far: {best_ppl:.4f}")
+        print(f"{'='*60}\n")
+    else:
+        # Evaluate before training
+        print(f"\n{'='*60}")
+        print(f"Evaluation BEFORE training")
+        print(f"{'='*60}")
+        initial_ppl, initial_loss = evaluate_ppl(model, eval_data, device, EVAL_SAMPLES)
+        print(f"Initial PPL: {initial_ppl:.4f}")
+        print(f"Initial Loss: {initial_loss:.6f}")
+        print(f"{'='*60}\n")
+        best_ppl = initial_ppl
 
     # Training
     print(f"{'='*60}")
@@ -219,8 +246,7 @@ def main():
     print(f"{'='*60}\n")
 
     model.train()
-    global_step = 0
-    best_ppl = initial_ppl
+    global_step = start_step
 
     num_samples = train_data.shape[0]
     num_batches = (num_samples + BATCH_SIZE - 1) // BATCH_SIZE
